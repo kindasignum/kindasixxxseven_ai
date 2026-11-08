@@ -137,8 +137,8 @@ def call_provider(body: dict):
 class Handler(BaseHTTPRequestHandler):
     server_version = "gateway"
 
-    def log_message(self, fmt, *args):  # свой лог вместо стандартного (в нём были бы адреса клиентов)
-        pass
+    def log_message(self, fmt, *args):  # свой лог вместо стандартного: пишем только метод и путь (без адресов и токенов)
+        log.info("Запрос: %s", (self.requestline or "").split(" HTTP")[0][:120])
 
     def _send(self, code: int, obj: dict):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -149,10 +149,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.split("?")[0] == "/health":
+        if self.path.split("?")[0] in ("/", "/health"):  # «/» нужен и для проверок живости на стороне хостинга
             return self._send(200, {"ok": True, "provider_key_set": bool(API_KEY), "token_set": bool(TOKEN),
                                     "models": sorted(ALLOWED_MODELS)})
         self._send(404, {"error": "not found"})
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):
         if self.path.split("?")[0] != "/v1/chat":
