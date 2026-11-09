@@ -6,7 +6,7 @@
     GATEWAY_TOKEN   — длинная случайная строка; бот присылает её в заголовке Authorization: Bearer ... (обязательно)
     GROQ_API_KEY    — ключ Groq (обязательно; можно назвать PROVIDER_KEY — для другого провайдера)
     PROVIDER_URL    — адрес chat/completions (по умолчанию Groq: https://api.groq.com/openai/v1/chat/completions)
-    ALLOWED_MODELS  — разрешённые модели через запятую (по умолчанию llama-3.3-70b-versatile,llama-3.1-8b-instant)
+    ALLOWED_MODELS  — разрешённые модели через запятую (по умолчанию openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.6-27b)
     PORT            — порт (по умолчанию 3000)
     MAX_TOKENS_CAP  — потолок max_tokens в одном ответе (по умолчанию 300)
     MAX_INPUT_CHARS — потолок размера запроса в символах (по умолчанию 12000)
@@ -39,11 +39,12 @@ TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
 PROVIDER_URL = os.getenv("PROVIDER_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
 PORT = int(os.getenv("PORT", "3000"))
 ALLOWED_MODELS = {m.strip() for m in os.getenv(
-    "ALLOWED_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant").split(",") if m.strip()}
+    "ALLOWED_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.6-27b").split(",") if m.strip()}
 MAX_TOKENS_CAP = int(os.getenv("MAX_TOKENS_CAP", "300"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "12000"))
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "1000"))
 MINUTE_LIMIT = int(os.getenv("MINUTE_LIMIT", "20"))
+REASONING_HEADROOM = int(os.getenv("REASONING_HEADROOM", "250"))  # запас токенов на рассуждения gpt-oss
 MAX_BODY_BYTES = 64 * 1024
 MAX_MESSAGES = 60
 UPSTREAM_TIMEOUT = 30
@@ -101,6 +102,11 @@ def validate(data: dict):
     max_tokens = max(1, min(max_tokens, MAX_TOKENS_CAP))
     body = {"model": model, "max_tokens": max_tokens,
             "messages": ([{"role": "system", "content": system}] if system.strip() else []) + clean}
+    if model.startswith("openai/gpt-oss"):
+        # «думающие» модели тратят часть лимита на рассуждения: ставим минимум рассуждений и добавляем запас,
+        # иначе при малом max_tokens ответ может получиться пустым
+        body["reasoning_effort"] = "low"
+        body["max_tokens"] = max_tokens + REASONING_HEADROOM
     temp = data.get("temperature")
     if isinstance(temp, (int, float)) and 0 <= temp <= 2:
         body["temperature"] = float(temp)
@@ -199,7 +205,9 @@ class Handler(BaseHTTPRequestHandler):
             # 429 от провайдера отдаём как 429, остальное — как 502, чтобы бот отличал «лимит» от «сломалось»
             return self._send(429 if code == 429 else 502, resp)
         try:
-            text = THINK_RE.sub("", resp["choices"][0]["message"]["content"] or "").strip()
+            choice = resp["choices"][0]
+            text = THINK_RE.sub("", choice["message"].get("content") or "").strip()
+            finish = choice.get("finish_reason")
             u = resp.get("usage") or {}
             usage = {"input": u.get("prompt_tokens", 0), "output": u.get("completion_tokens", 0)}
         except (KeyError, IndexError, TypeError):
@@ -207,7 +215,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(502, {"error": "provider_bad_format"})
         log.info("OK модель=%s вход=%s выход=%s за %.1f с", body["model"], usage["input"], usage["output"],
                  time.time() - started)
-        self._send(200, {"text": text, "usage": usage})
+        if not text:
+            log.warning("Пустой ответ модели (finish_reason=%s) — возможно, лимит токенов ушёл на рассуждения", finish)
+        self._send(200, {"text": text, "usage": usage, "finish_reason": finish})
 
 
 def main():
